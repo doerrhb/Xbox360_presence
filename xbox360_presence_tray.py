@@ -23,6 +23,9 @@ from presence_service import (
 )
 from windows_startup import is_startup_enabled, set_startup_enabled
 
+VERSION = "1.1.0"
+ICON_SIZE = 64  # pystray works best with 64x64
+
 
 class TrayApplication:
     def __init__(self) -> None:
@@ -34,7 +37,7 @@ class TrayApplication:
     def run(self) -> None:
         self.icon = pystray.Icon(
             "Xbox360Presence",
-            self._load_icon_image(),
+            self._load_icon_image(active=False),
             APP_NAME,
             menu=self._build_menu(),
         )
@@ -43,11 +46,7 @@ class TrayApplication:
 
     def _build_menu(self) -> pystray.Menu:
         return pystray.Menu(
-            pystray.MenuItem(
-                lambda item: self._status_label(),
-                None,
-                enabled=False,
-            ),
+            pystray.MenuItem("Running - Waiting for Xbox", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Start Rich Presence",
@@ -60,14 +59,10 @@ class TrayApplication:
                 self._stop_presence,
                 enabled=lambda item: self.worker.is_active,
             ),
-            pystray.MenuItem(
-                "Restart Rich Presence",
-                self._restart_presence,
-                enabled=lambda item: self.worker.is_active,
-            ),
+
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Configure...", self._open_config_dialog),
-            pystray.MenuItem("Open Config Folder", self._open_config_folder),
+            pystray.MenuItem("About", self._open_about_dialog),
             pystray.MenuItem(
                 "Run at Windows startup",
                 self._toggle_startup,
@@ -83,51 +78,118 @@ class TrayApplication:
             message = f"{message[:61]}..."
         return f"Status: {message}"
 
-    def _load_icon_image(self) -> Image.Image:
+    # ------------------------------------------------------------------
+    # Icon image with overlay
+    # ------------------------------------------------------------------
+
+    def _load_icon_image(self, active: bool = False) -> Image.Image:
+        """Load avatar.ico, resize to 64x64, and draw a status overlay."""
         icon_path = resource_path("avatar.ico")
         try:
-            return Image.open(icon_path)
+            base_image = Image.open(icon_path).convert("RGBA")
+            # Resize to consistent 64x64 so the overlay is always visible
+            base_image = base_image.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
         except Exception:
-            image = Image.new("RGBA", (64, 64), (20, 20, 20, 0))
-            draw = ImageDraw.Draw(image)
-            draw.ellipse((8, 8, 56, 56), fill=(38, 132, 62, 255))
-            draw.rectangle((20, 27, 44, 37), fill=(255, 255, 255, 255))
-            return image
+            # Fallback: plain green circle if icon file is missing
+            base_image = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(base_image)
+            draw.ellipse((4, 4, 60, 60), fill=(38, 132, 62, 255))
+            draw.rectangle((18, 27, 46, 37), fill=(255, 255, 255, 255))
+
+        # Always work on a copy so repeated calls never mutate cached data
+        img = base_image.copy()
+        draw = ImageDraw.Draw(img)
+
+        # Overlay: bottom-right corner, 20x20 area with 2px padding
+        overlay_size = 20
+        pad = 2
+        x1 = ICON_SIZE - pad - overlay_size
+        y1 = ICON_SIZE - pad - overlay_size
+        x2 = ICON_SIZE - pad
+        y2 = ICON_SIZE - pad
+
+        if active:
+            # Green play triangle (▶)
+            draw.polygon(
+                [(x1, y1), (x2, (y1 + y2) // 2), (x1, y2)],
+                fill=(0, 200, 0, 255),
+            )
+        else:
+            # Red stop square (■)
+            draw.rectangle(
+                [(x1, y1), (x2, y2)],
+                fill=(220, 0, 0, 255),
+            )
+
+        return img
+
+    # ------------------------------------------------------------------
+    # Status callback & icon refresh
+    # ------------------------------------------------------------------
 
     def _on_status_changed(self, state: str, message: str) -> None:
+        """Called by PresenceWorker from its background thread."""
         if self.icon is None:
             return
-
-        title = f"{APP_NAME} - {message}"
-        self.icon.title = title[:127]
+        self.icon.icon = self._load_icon_image(active=self.worker.is_active)
         self.icon.update_menu()
+
+    def _refresh_icon(self) -> None:
+        """Convenience to update icon + menu from UI actions."""
+        if self.icon is None:
+            return
+        self.icon.icon = self._load_icon_image(active=self.worker.is_active)
+        self.icon.update_menu()
+
+    # ------------------------------------------------------------------
+    # Menu actions
+    # ------------------------------------------------------------------
 
     def _start_presence(self, icon=None, item=None) -> None:
         self.worker.start()
-        self._refresh_menu()
+        self._refresh_icon()
 
     def _stop_presence(self, icon=None, item=None) -> None:
         self.worker.stop()
-        self._refresh_menu()
+        self._refresh_icon()
 
     def _restart_presence(self, icon=None, item=None) -> None:
         self.worker.restart()
-        self._refresh_menu()
+        self._refresh_icon()
 
     def _toggle_startup(self, icon=None, item=None) -> None:
         try:
             set_startup_enabled(not is_startup_enabled())
         except RuntimeError as exc:
-            messagebox.showerror(APP_NAME, str(exc))
-        self._refresh_menu()
+            self._show_messagebox_threadsafe("error", APP_NAME, str(exc))
+        self._refresh_icon()
 
-    def _open_config_folder(self, icon=None, item=None) -> None:
-        config_path = ensure_config_file()
-        folder = config_path.parent
-        if os.name == "nt":
-            os.startfile(str(folder))  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", str(folder)])
+    # ------------------------------------------------------------------
+    # About dialog — runs in its own thread with its own Tk root
+    # ------------------------------------------------------------------
+
+    def _open_about_dialog(self, icon=None, item=None) -> None:
+        """Show About dialog. Spawns a dedicated thread so the messagebox
+        gets its own Tk event-loop and closes reliably on OK."""
+        t = threading.Thread(target=self._show_about, daemon=True)
+        t.start()
+
+    def _show_about(self) -> None:
+        status = ""
+        if self.worker:
+            status = f"State: {self.worker.state}\nMessage: {self.worker.message}"
+        text = f"{APP_NAME}\nVersion: {VERSION}\n\n{status}"
+
+        root = tk.Tk()
+        root.withdraw()
+        # Bring the messagebox to the front
+        root.attributes("-topmost", True)
+        messagebox.showinfo(APP_NAME, text, parent=root)
+        root.destroy()
+
+    # ------------------------------------------------------------------
+    # Config dialog (unchanged logic, already threaded)
+    # ------------------------------------------------------------------
 
     def _open_config_dialog(self, icon=None, item=None) -> None:
         with self._config_window_lock:
@@ -208,14 +270,30 @@ class TrayApplication:
             with self._config_window_lock:
                 self._config_window_open = False
 
+    # ------------------------------------------------------------------
+    # Exit
+    # ------------------------------------------------------------------
+
     def _exit_app(self, icon=None, item=None) -> None:
         self.worker.stop(timeout=5)
         if self.icon is not None:
             self.icon.stop()
 
-    def _refresh_menu(self) -> None:
-        if self.icon is not None:
-            self.icon.update_menu()
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _show_messagebox_threadsafe(kind: str, title: str, message: str) -> None:
+        """Show a messagebox from any thread by creating a temporary Tk root."""
+        def _show():
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            fn = messagebox.showerror if kind == "error" else messagebox.showinfo
+            fn(title, message, parent=root)
+            root.destroy()
+        threading.Thread(target=_show, daemon=True).start()
 
 
 def main() -> None:

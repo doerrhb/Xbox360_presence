@@ -1,5 +1,5 @@
 #define MyAppName "Xbox360 Presence"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Xbox360 Presence"
 #define MyAppExeName "Xbox360Presence.exe"
 
