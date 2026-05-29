@@ -249,7 +249,11 @@ def update_discord_presence(
     title_id = fetch_title_id(ip_address)
 
     if not title_id:
-        return start_time, last_title_id, last_printed_minute, "Running: no title ID"
+        try:
+            rpc.clear()
+        except Exception:
+            pass
+        return start_time, None, last_printed_minute, "Running: no title ID"
 
     game_name, image_url = resolve_game(title_id)
 
@@ -363,6 +367,11 @@ class PresenceWorker:
                     )
                     self._set_status("running", status_message)
                 except requests.RequestException as exc:
+                    try:
+                        rpc.clear()
+                    except Exception:
+                        pass
+                    last_title_id = None
                     self._set_status("running", f"Running: waiting for Xbox ({exc})")
                 except Exception as exc:
                     self._set_status("error", f"Stopped: {exc}")
@@ -427,10 +436,15 @@ def run_foreground(ip_override: Optional[str] = None) -> None:
                 )
             except requests.RequestException as exc:
                 print(
-                    f"Error connecting to the Xbox at http://{ip_address}:9999/title: {exc}",
+                    f"Error connecting to the Xbox at http://{ip_address}:9999/title: {exc}. "
+                    "Xbox presence cleared. Retrying...",
                     flush=True,
                 )
-                raise
+                try:
+                    rpc.clear()
+                except Exception:
+                    pass
+                last_title_id = None
             time.sleep(POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         print("Disconnecting from Discord...", flush=True)
