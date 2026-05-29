@@ -26,7 +26,7 @@ This application updates your Discord Rich Presence with the game currently bein
 
 ## 🛠️ Requirements
 
-*   A modded Xbox 360 running the Aurora dashboard with the **Nova plugin** active.
+*   A modded Xbox 360 running the Aurora dashboard with the **Nova plugin** active.  Security should be disabled.
 *   Your own [Discord Application Client ID](https://discord.com/developers/applications).
 *   Python 3.x installed (if running from source).
 *   Dependencies listed in `requirements.txt` (installed automatically in the EXE release).
