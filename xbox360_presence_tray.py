@@ -23,7 +23,7 @@ from presence_service import (
 )
 from windows_startup import is_startup_enabled, set_startup_enabled
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ICON_SIZE = 64  # pystray works best with 64x64
 
 

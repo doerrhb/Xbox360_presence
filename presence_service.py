@@ -20,6 +20,8 @@ CONFIG_FILE_NAME = "config.ini"
 DEFAULT_CONFIG_FILE_NAME = "config_default.ini"
 TITLE_IDS_FILE_NAME = "xbox360titleids.json"
 POLL_INTERVAL_SECONDS = 15
+INITIAL_RECONNECT_DELAY_SECONDS = 5
+MAX_RECONNECT_DELAY_SECONDS = 60
 
 PLACEHOLDER_CLIENT_ID = "YOUR_CLIENT_ID_HERE"
 PLACEHOLDER_IP_ADDRESS = "YOUR_XBOX_IP_HERE"
@@ -334,70 +336,101 @@ class PresenceWorker:
         if self.status_callback:
             self.status_callback(state, message)
 
-    def _run(self) -> None:
-        rpc = None
-        connected = False
+    def _wait_or_stop(self, seconds: float) -> bool:
+        return self._stop_event.wait(seconds)
+
+    @staticmethod
+    def _close_rpc(rpc: Optional[Presence], connected: bool) -> None:
+        if rpc is None or not connected:
+            return
 
         try:
-            settings = load_settings(require_ready=True)
-            self._set_status("connecting", "Connecting to Discord")
+            rpc.clear()
+        except Exception:
+            pass
+        try:
+            rpc.close()
+        except Exception:
+            pass
 
-            rpc = Presence(settings.client_id)
-            rpc.connect()
-            connected = True
+    def _run(self) -> None:
+        reconnect_delay = INITIAL_RECONNECT_DELAY_SECONDS
 
-            start_time = datetime.now()
-            last_title_id = None
-            last_printed_minute = None
-            self._set_status("running", f"Running: polling {settings.ip_address}")
+        while not self._stop_event.is_set():
+            rpc = None
+            connected = False
 
-            while not self._stop_event.is_set():
-                try:
-                    (
-                        start_time,
-                        last_title_id,
-                        last_printed_minute,
-                        status_message,
-                    ) = update_discord_presence(
-                        rpc,
-                        settings.ip_address,
-                        start_time,
-                        last_title_id,
-                        last_printed_minute,
-                    )
-                    self._set_status("running", status_message)
-                except requests.RequestException as exc:
+            try:
+                settings = load_settings(require_ready=True)
+                self._set_status("connecting", "Connecting to Discord")
+
+                rpc = Presence(settings.client_id)
+                rpc.connect()
+                connected = True
+                reconnect_delay = INITIAL_RECONNECT_DELAY_SECONDS
+
+                start_time = datetime.now()
+                last_title_id = None
+                last_printed_minute = None
+                self._set_status("running", f"Running: polling {settings.ip_address}")
+
+                while not self._stop_event.is_set():
                     try:
-                        rpc.clear()
-                    except Exception:
-                        pass
-                    last_title_id = None
-                    self._set_status("running", f"Running: waiting for Xbox ({exc})")
-                except Exception as exc:
-                    self._set_status("error", f"Stopped: {exc}")
-                    break
+                        (
+                            start_time,
+                            last_title_id,
+                            last_printed_minute,
+                            status_message,
+                        ) = update_discord_presence(
+                            rpc,
+                            settings.ip_address,
+                            start_time,
+                            last_title_id,
+                            last_printed_minute,
+                        )
+                        self._set_status("running", status_message)
+                    except requests.RequestException as exc:
+                        try:
+                            rpc.clear()
+                        except Exception:
+                            pass
+                        last_title_id = None
+                        self._set_status(
+                            "running", f"Running: waiting for Xbox ({exc})"
+                        )
+                    except Exception as exc:
+                        self._set_status(
+                            "reconnecting",
+                            f"Discord connection lost ({exc}); reconnecting",
+                        )
+                        break
 
-                if self._stop_event.wait(self.poll_interval):
-                    break
+                    if self._wait_or_stop(self.poll_interval):
+                        break
 
-        except ConfigError as exc:
-            self._set_status("needs_config", str(exc))
-        except Exception as exc:
-            self._set_status("error", f"Stopped: {exc}")
-        finally:
-            if rpc is not None and connected:
-                try:
-                    rpc.clear()
-                except Exception:
-                    pass
-                try:
-                    rpc.close()
-                except Exception:
-                    pass
+            except ConfigError as exc:
+                self._set_status("needs_config", str(exc))
+                return
+            except Exception as exc:
+                self._set_status("reconnecting", f"Waiting for Discord ({exc})")
+            finally:
+                self._close_rpc(rpc, connected)
 
             if self._stop_event.is_set():
-                self._set_status("stopped", "Stopped")
+                break
 
+            self._set_status(
+                "reconnecting",
+                f"Reconnecting in {reconnect_delay} seconds",
+            )
+            if self._wait_or_stop(reconnect_delay):
+                break
+            reconnect_delay = min(
+                reconnect_delay * 2,
+                MAX_RECONNECT_DELAY_SECONDS,
+            )
+
+        self._set_status("stopped", "Stopped")
 
 def run_foreground(ip_override: Optional[str] = None) -> None:
     settings = load_settings(prefer_local=True, require_ready=False)
